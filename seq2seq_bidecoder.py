@@ -5,43 +5,52 @@ import numpy as np
 import pymongo
 from tqdm import tqdm
 import os,json
-import uniout
 from keras.layers import *
 from keras_layer_normalization import LayerNormalization
 from keras.models import Model
 from keras import backend as K
 from keras.callbacks import Callback
 from keras.optimizers import Adam
+import pandas as pd
+import copy
+import tensorflow as tf
 
-
-min_count = 32
+min_count = 0
 maxlen = 400
 batch_size = 64
 epochs = 100
 char_size = 128
 z_dim = 128
-db = pymongo.MongoClient().text.thucnews # 我的数据存在mongodb中
+chars = None
+id2char = None
+char2id = None
 
 
-if os.path.exists('seq2seq_config.json'):
-    chars,id2char,char2id = json.load(open('seq2seq_config.json'))
-    id2char = {int(i):j for i,j in id2char.items()}
-else:
-    chars = {}
-    for a in tqdm(db.find()):
-        for w in a['content']: # 纯文本，不用分词
-            chars[w] = chars.get(w,0) + 1
-        for w in a['title']: # 纯文本，不用分词
-            chars[w] = chars.get(w,0) + 1
-    chars = {i:j for i,j in chars.items() if j >= min_count}
-    # 0: mask
-    # 1: unk
-    # 2: start
-    # 3: end
-    id2char = {i+4:j for i,j in enumerate(chars)}
-    char2id = {j:i for i,j in id2char.items()}
-    json.dump([chars,id2char,char2id], open('seq2seq_config.json', 'w'))
 
+
+
+def init(path="data/train.xlsx"):
+    
+    df = pd.read_excel(path)
+    if os.path.exists('seq2seq_config.json'):
+        chars,id2char,char2id = json.load(open('seq2seq_config.json'))
+        id2char = {int(i):j for i,j in id2char.items()}
+    else:
+        chars = {}
+        for index, a in df.iterrows():
+            for w in a['content']: # 纯文本，不用分词
+                chars[w] = chars.get(w,0) + 1
+            for w in a['title']: # 纯文本，不用分词
+                chars[w] = chars.get(w,0) + 1
+        chars = {i:j for i,j in chars.items() if j >= min_count}
+        # 0: mask
+        # 1: unk
+        # 2: start
+        # 3: end
+        id2char = {i+4:j for i,j in enumerate(chars)}
+        char2id = {j:i for i,j in id2char.items()}
+        json.dump([chars,id2char,char2id], open('seq2seq_config.json', 'w'))
+    return df, chars,id2char,char2id
 
 def str2id(s, start_end=False):
     # 文字转整数id
@@ -64,11 +73,12 @@ def padding(x):
     return [i + [0] * (ml-len(i)) for i in x]
 
 
-def data_generator():
+
+def data_generator(data):
     # 数据生成器
     X, Y1, Y2 = [], [], []
     while True:
-        for a in db.find():
+        for a in data:
             X.append(str2id(a['content']))
             Y1.append(str2id(a['title'], start_end=True))
             Y2.append(str2id(a['title'], start_end=True)[::-1])
@@ -166,7 +176,7 @@ class OurBidirectional(OurLayer):
         """
         seq_len = K.round(K.sum(mask, 1)[:, 0])
         seq_len = K.cast(seq_len, 'int32')
-        return K.tf.reverse_sequence(x, seq_len, seq_dim=1)
+        return tf.reverse_sequence(x, seq_len, seq_dim=1)
     def call(self, inputs):
         x, mask = inputs
         x_forward = self.reuse(self.forward_layer, x)
@@ -294,78 +304,79 @@ class Attention(OurLayer):
 
 
 # 搭建seq2seq模型
-
-x_in = Input(shape=(None,))
-yl_in = Input(shape=(None,))
-yr_in = Input(shape=(None,))
-x, yl, yr = x_in, yl_in, yr_in
-
-x_mask = Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(x)
-y_mask = Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(yl)
-
-x_one_hot = Lambda(to_one_hot)([x, x_mask])
-x_prior = ScaleShift()(x_one_hot) # 学习输出的先验分布（标题的字词很可能在文章出现过）
-
-embedding = Embedding(len(chars)+4, char_size)
-x = embedding(x)
-
-# encoder，双层双向LSTM
-x = LayerNormalization()(x)
-x = OurBidirectional(CuDNNLSTM(z_dim // 2, return_sequences=True))([x, x_mask])
-x = LayerNormalization()(x)
-x = OurBidirectional(CuDNNLSTM(z_dim // 2, return_sequences=True))([x, x_mask])
-x_max = Lambda(seq_maxpool)([x, x_mask])
-
-# 正向decoder，单向LSTM
-y = embedding(yl)
-y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
-y = CuDNNLSTM(z_dim, return_sequences=True)(y)
-y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
-y = CuDNNLSTM(z_dim, return_sequences=True)(y)
-yl = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
-
-# 逆向decoder，单向LSTM
-y = embedding(yr)
-y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
-y = CuDNNLSTM(z_dim, return_sequences=True)(y)
-y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
-y = CuDNNLSTM(z_dim, return_sequences=True)(y)
-yr = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
-
-# 对齐attention + 检索attention
-yl_ = Attention(8, 16, mask_right=True)([yl, yr, yr])
-ylx = Attention(8, 16)([yl, x, x, x_mask])
-yl = Concatenate()([yl, yl_, ylx])
-# 对齐attention + 检索attention
-yr_ = Attention(8, 16, mask_right=True)([yr, yl, yl])
-yrx = Attention(8, 16)([yr, x, x, x_mask])
-yr = Concatenate()([yr, yr_, yrx])
-
-# 最后的输出分类（左右共享权重）
-classifier = Dense(len(chars)+4)
-
-yl = Dense(char_size)(yl)
-yl = LeakyReLU(0.2)(yl)
-yl = classifier(yl)
-yl = Lambda(lambda x: (x[0]+x[1])/2)([yl, x_prior]) # 与先验结果平均
-yl = Activation('softmax')(yl)
-
-yr = Dense(char_size)(yr)
-yr = LeakyReLU(0.2)(yr)
-yr = classifier(yr)
-yr = Lambda(lambda x: (x[0]+x[1])/2)([yr, x_prior]) # 与先验结果平均
-yr = Activation('softmax')(yr)
-
-# 交叉熵作为loss，但mask掉padding部分
-cross_entropy_1 = K.sparse_categorical_crossentropy(yl_in[:, 1:], yl[:, :-1])
-cross_entropy_1 = K.sum(cross_entropy_1 * y_mask[:, 1:, 0]) / K.sum(y_mask[:, 1:, 0])
-cross_entropy_2 = K.sparse_categorical_crossentropy(yr_in[:, 1:], yr[:, :-1])
-cross_entropy_2 = K.sum(cross_entropy_2 * y_mask[:, 1:, 0]) / K.sum(y_mask[:, 1:, 0])
-cross_entropy = (cross_entropy_1 + cross_entropy_2) / 2
-
-model = Model([x_in, yl_in, yr_in], [yl, yr])
-model.add_loss(cross_entropy)
-model.compile(optimizer=Adam(1e-3))
+def build_model():
+    x_in = Input(shape=(None,))
+    yl_in = Input(shape=(None,))
+    yr_in = Input(shape=(None,))
+    x, yl, yr = x_in, yl_in, yr_in
+    
+    x_mask = Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(x)
+    y_mask = Lambda(lambda x: K.cast(K.greater(K.expand_dims(x, 2), 0), 'float32'))(yl)
+    
+    x_one_hot = Lambda(to_one_hot)([x, x_mask])
+    x_prior = ScaleShift()(x_one_hot) # 学习输出的先验分布（标题的字词很可能在文章出现过）
+    
+    embedding = Embedding(len(chars)+4, char_size)
+    x = embedding(x)
+    
+    # encoder，双层双向LSTM
+    x = LayerNormalization()(x)
+    x = OurBidirectional(CuDNNLSTM(z_dim // 2, return_sequences=True))([x, x_mask])
+    x = LayerNormalization()(x)
+    x = OurBidirectional(CuDNNLSTM(z_dim // 2, return_sequences=True))([x, x_mask])
+    x_max = Lambda(seq_maxpool)([x, x_mask])
+    
+    # 正向decoder，单向LSTM
+    y = embedding(yl)
+    y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
+    y = CuDNNLSTM(z_dim, return_sequences=True)(y)
+    y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
+    y = CuDNNLSTM(z_dim, return_sequences=True)(y)
+    yl = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
+    
+    # 逆向decoder，单向LSTM
+    y = embedding(yr)
+    y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
+    y = CuDNNLSTM(z_dim, return_sequences=True)(y)
+    y = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
+    y = CuDNNLSTM(z_dim, return_sequences=True)(y)
+    yr = SelfModulatedLayerNormalization(z_dim // 4)([y, x_max])
+    
+    # 对齐attention + 检索attention
+    yl_ = Attention(8, 16, mask_right=True)([yl, yr, yr])
+    ylx = Attention(8, 16)([yl, x, x, x_mask])
+    yl = Concatenate()([yl, yl_, ylx])
+    # 对齐attention + 检索attention
+    yr_ = Attention(8, 16, mask_right=True)([yr, yl, yl])
+    yrx = Attention(8, 16)([yr, x, x, x_mask])
+    yr = Concatenate()([yr, yr_, yrx])
+    
+    # 最后的输出分类（左右共享权重）
+    classifier = Dense(len(chars)+4)
+    
+    yl = Dense(char_size)(yl)
+    yl = LeakyReLU(0.2)(yl)
+    yl = classifier(yl)
+    yl = Lambda(lambda x: (x[0]+x[1])/2)([yl, x_prior]) # 与先验结果平均
+    yl = Activation('softmax')(yl)
+    
+    yr = Dense(char_size)(yr)
+    yr = LeakyReLU(0.2)(yr)
+    yr = classifier(yr)
+    yr = Lambda(lambda x: (x[0]+x[1])/2)([yr, x_prior]) # 与先验结果平均
+    yr = Activation('softmax')(yr)
+    
+    # 交叉熵作为loss，但mask掉padding部分
+    cross_entropy_1 = K.sparse_categorical_crossentropy(yl_in[:, 1:], yl[:, :-1])
+    cross_entropy_1 = K.sum(cross_entropy_1 * y_mask[:, 1:, 0]) / K.sum(y_mask[:, 1:, 0])
+    cross_entropy_2 = K.sparse_categorical_crossentropy(yr_in[:, 1:], yr[:, :-1])
+    cross_entropy_2 = K.sum(cross_entropy_2 * y_mask[:, 1:, 0]) / K.sum(y_mask[:, 1:, 0])
+    cross_entropy = (cross_entropy_1 + cross_entropy_2) / 2
+    
+    model = Model([x_in, yl_in, yr_in], [yl, yr])
+    model.add_loss(cross_entropy)
+    model.compile(optimizer=Adam(1e-3))
+    return model
 
 
 def gen_sent(s, topk=3, maxlen=64):
@@ -448,17 +459,18 @@ class Evaluate(Callback):
         self.lowest = 1e10
     def on_epoch_end(self, epoch, logs=None):
         # 训练过程中观察一两个例子，显示标题质量提高的过程
-        print gen_sent(s1)
-        print gen_sent(s2)
+        print(gen_sent(s1))
+        print(gen_sent(s2))
         # 保存最优结果
         if logs['loss'] <= self.lowest:
             self.lowest = logs['loss']
             model.save_weights('./best_model.weights')
 
-
-evaluator = Evaluate()
-
-model.fit_generator(data_generator(),
-                    steps_per_epoch=1000,
-                    epochs=epochs,
-                    callbacks=[evaluator])
+if __name__ == "__main__":
+    df, chars,id2char,char2id = init()
+    model = build_model()
+    evaluator = Evaluate()
+    model.fit_generator(data_generator(df),
+                        steps_per_epoch=1000,
+                        epochs=epochs,
+                        callbacks=[evaluator])
